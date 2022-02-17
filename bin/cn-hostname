@@ -1,0 +1,63 @@
+#!/bin/bash
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright 2022 Joyent, Inc.
+
+# shellcheck disable=SC2154
+if [[ -n "$TRACE" ]]; then
+    export PS4='[\D{%FT%TZ}] ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+    set -o xtrace
+fi
+
+# shellcheck disable=SC1091
+source /lib/sdc/config.sh
+
+load_sdc_config
+
+shopt -s expand_aliases
+
+fatal () {
+    code="$1"; shift
+
+    printf '%s\n' "$*"
+    exit "$code"
+}
+
+is_valid_cn () {
+    sdc-server lookup uuid="$1" setup=true | grep "$1" >/dev/null
+}
+
+function display_cn_hostname () {
+    is_valid_cn "$1" || fatal 1 "$1 is not set up in this datacenter."
+    cn_hostname=$(sdc-cnapi "/servers/$1" | json hostname)
+    printf '%s\n' "$cn_hostname"
+}
+
+function set_cn_hostname () {
+    is_valid_cn "$1" || fatal 1 "$1 is not set up in this datacenter."
+    cat > "/zones/$(sdc-vmname moray)/root/tmp/fix_$1.sh" << EOF
+#!/bin/bash -x
+export PATH=/opt/smartdc/moray/build/node/bin:$PATH
+/opt/smartdc/moray/node_modules/.bin/updatemany -h 127.0.0.1 -d '{ "hostname": "$2" }' cnapi_servers "(uuid=$1)"
+EOF
+    chmod +x "/zones/$(sdc-vmname moray)/root/tmp/fix_$1.sh"
+    sdc-login -l moray "/bin/bash -c /tmp/fix_$1.sh"
+    rm "/zones/$(sdc-vmname moray)/root/tmp/fix_$1.sh"
+
+    printf 'CN %s must be rebooted for changes to take effect.\n' "$1"
+}
+
+usage () {
+    printf '%s uuid\tDisplay hostname for CN uuid\n' "$0"
+    printf '%s uuid hostname\tSet hostname for CN uuid\n' "$0"
+    exit "$1"
+}
+
+case ${BASH_ARGC[1]} in
+    1) display_cn_hostname "$1";;
+    2) set_cn_hostname "$1" "$2";;
+    *) printf 'Invalid syntax\n\n'; usage 1;;
+esac

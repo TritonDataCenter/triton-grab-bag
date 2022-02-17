@@ -1,0 +1,35 @@
+#!/bin/bash
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright 2022 Joyent, Inc.
+
+# shellcheck disable=SC2154
+if [[ -n "$TRACE" ]]; then
+    export PS4='[\D{%FT%TZ}] ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+    set -o xtrace
+fi
+
+function ufds_get() {
+    local cn="${1:?}"
+    local result
+    result=$(sdc-ufds search -b "cn=${cn}, ou=groups, o=smartdc" -s base '(objectclass=*)' uniquemember | json uniquemember)
+    if (( $(wc -l <<< "$result") == 1 )); then
+        echo "$result"
+    else
+        json -a <<< "$result"
+    fi
+}
+
+# shellcheck disable=2207
+operators=( $(ufds_get operators | awk -F, '{print $1}') )
+# shellcheck disable=2207
+readers=( $(ufds_get readers | awk -F, '{print $1}') )
+
+opers=( "${operators[@]}" "${readers[@]}" )
+
+for oper in "${opers[@]}"; do
+    sdc-ufds search "$oper" | /opt/smartdc/bin/json -a -e 'this.d=new Date(parseInt(this.pwdchangedtime)).toJSON()' uuid d login email cn
+done

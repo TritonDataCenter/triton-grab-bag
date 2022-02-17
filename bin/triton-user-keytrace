@@ -1,0 +1,133 @@
+#!/bin/bash
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright 2022 Joyent, Inc.
+
+# shellcheck disable=SC2154
+if [[ -n "$TRACE" ]]; then
+    export PS4='[\D{%FT%TZ}] ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+    set -o xtrace
+fi
+
+DEBUG=0
+PRINT_DELETE=0
+HEADER=0
+
+function log
+{
+     (( DEBUG )) && printf 'DEBUG - %s\n' "$1" >&2
+}
+
+function is_uuid
+{
+    local uuid="$1"
+
+    if [[ $uuid =~ ^\{?[A-F0-9a-f]{8}-[A-F0-9a-f]{4}-[A-F0-9a-f]{4}-[A-F0-9a-f]{4}-[A-F0-9a-f]{12}\}?$ ]]
+    then
+        return 0
+    else
+        return 1
+    fi
+}
+######################################################################
+
+THESE_OPTS="dDh"
+#  Function:
+#     use-o-matic()
+#  Purpose:
+#    prints to stdout a usage statement with a brief description of each option
+#  Parameters:
+#    None
+#  Expected Result:
+#    Usage statement output to stdout
+#  Error conditions:
+#     0 for true when done
+#
+usage()
+{
+    echo
+    echo "Usage: $(basename "$0") -${THESE_OPTS//:/} login|uuid"
+    echo
+    echo "    -d - turn on debug output.  DEBUG set to positive integer value in env works as well"
+    echo "    -D - show key DELETE commands"
+    echo "    -H - show the header above key output lines"
+    echo "    -h - show this help"
+    return 0
+}
+
+#############################################
+#                                           #
+#          MAIN section                     #
+#                                           #
+#############################################
+while getopts "$THESE_OPTS" Option
+do
+    case $Option in
+        d ) ((DEBUG += 1)) ;;
+        D ) ((PRINT_DELETE += 1)) ;;
+        H ) ((HEADER += 1)) ;;
+        h ) usage ; exit 0 ;;
+        * ) echo "ERROR bad parameter passed: ${OPTARG}."
+            usage
+            exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1)) # Move argument pointer to next.
+
+user="$1"
+
+if is_uuid "$user"
+then
+    log "User specified: $user is a uuid"
+    main_uuid="$user"
+else
+    log "User specified: $user is NOT a uuid, looking that up with sdc-useradm"
+    main_uuid="$(pfexec sdc-useradm get "$user" | json -Ha uuid)"
+    if is_uuid "$main_uuid"
+    then
+        log "uuid looked up via sdc-useradm: $main_uuid validates as a uuid, using it"
+    else
+        log "uuid looked up via sdc-useradm: $main_uuid didn't validate as a uuid, exiting"
+        exit 1
+    fi
+fi
+
+log "Finding all historic keys for account uuid $main_uuid"
+# shellcheck disable=SC2207
+fingerprints=( $(pfexec sdc-ldap search -b cn=changelog  "(&(changetype=add)(targetdn=fingerprint=* uuid=$main_uuid, ou=users, o=smartdc))" changes | awk '($1 ~ /^changes/ ){print }' | cut -d: -f 2- | json  -ga fingerprint[0] | sort | uniq) )
+
+(( HEADER )) && printf '%-47s %-36s %-24s %-32s %-12s %s\n' "Fingerprint" "UUID" "Login" "E-mail" "provisioning" "memberof"
+log "Found ${#fingerprints[@]} keys"
+for this_fingerprint in "${fingerprints[@]}"
+do
+    log "    Searching for any account having key with fingerprint $this_fingerprint"
+    # shellcheck disable=SC2207
+    users_with_key=( $(pfexec sdc-ufds search "(&(objectclass=sdckey)(fingerprint=$this_fingerprint))" | json -Hga dn | awk -F'[ ,=]' '{print $5}') )
+    log "    found ${#users_with_key[@]}"
+    for uuid in "${users_with_key[@]}"; do
+        read -r this_uuid this_login this_email this_approved_for_provisioning this_memberof  <<<"$(pfexec sdc-useradm get "$uuid" | json -Ha uuid login email approved_for_provisioning memberof.0)"
+        log "        Found uuid: [$this_uuid] login: [$this_login] email: [$this_email] provisioning: [$this_approved_for_provisioning] memberof: [$this_memberof]"
+        if [[ "$this_uuid" == "$main_uuid" ]]
+        then
+            log "        Account $this_uuid matches the source account $main_uuid, skipping"
+            continue
+        fi
+
+        if [[ "$this_approved_for_provisioning" == 'true' ]]
+        then
+            if (( HEADER ))
+            then
+                printf '%-47s %-36s %-24s %-32s %-12s %s\n' "$this_fingerprint" "$this_uuid" "$this_login" "$this_email" "$this_approved_for_provisioning" "$this_memberof"
+            else
+                printf '%s %s %s %s %s %s\n' "$this_fingerprint" "$this_uuid" "$this_login" "$this_email" "$this_approved_for_provisioning" "$this_memberof"
+            fi
+            (( PRINT_DELETE )) && printf '# To delete this key run:\npfexec sdc-useradm delete-key %s %s\n\n' "$uuid" "$this_fingerprint"
+        else
+            log "        Account $uuid is already disabled, skipping"
+            continue
+        fi
+    done
+done

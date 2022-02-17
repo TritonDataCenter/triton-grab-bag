@@ -1,0 +1,78 @@
+#!/bin/bash
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright 2022 Joyent, Inc.
+
+# shellcheck disable=SC2154
+if [[ -n "$TRACE" ]]; then
+    export PS4='[\D{%FT%TZ}] ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+    set -o xtrace
+fi
+
+action=$1; shift
+cn=$1; shift
+
+set -o errexit
+
+get_server_uuid () {
+    if (( ${#cn} == 36 )); then
+        echo "$cn"
+    else
+        if ! sdc-cnapi "/servers?hostname=$cn" -f | json -Ha uuid; then
+            usage ; exit 1
+        fi
+    fi
+}
+
+do_delete_comment () {
+    sdc-cnapi "/servers/$uuid" -f -X POST -d '{"comments":""}' 2>/dev/null
+}
+
+do_set_comment() {
+    if [[ -z $1 ]]; then
+        echo "Cannot set empty comment. Use delete instead."
+        usage; exit 1
+    fi
+    json=$(json -o json-0 -e "this.comments=\"$*\"" <<< '{}')
+    sdc-cnapi "/servers/$uuid" -f -X POST -d "$json" >/dev/null
+    do_get_comment
+}
+
+do_get_comment () {
+    if [[ $cn == all ]]; then
+        sdc-cnapi /servers | json -Ha -c 'comments!==""' hostname comments
+    else
+        printf "%s: " "$cn"
+        sdc-cnapi "/servers/$uuid" -f | json -Ha comments
+    fi
+}
+
+usage () {
+    printf "Usage:\n"
+    printf "\t%s get CN\n" "${0/.*\/}"
+    printf "\t%s set CN comment\n" "${0/.*\/}"
+    printf "\t%s delete CN\n" "${0/.*\/}"
+    printf "\nNote: comment should not be quoted.\n"
+}
+
+if [[ -z $cn ]]; then
+    echo "No CN provided"
+    usage ; exit 1
+fi
+
+uuid=$(get_server_uuid)
+
+if [[ -z $uuid ]] && [[ $cn != all ]]; then
+    printf "Invalid CN: %s\n" "$cn"
+    usage ; exit 1
+fi
+
+case "${action:=get}" in
+    del|delete) do_delete_comment;;
+    set) do_set_comment "$*";;
+    get) do_get_comment;;
+    *) usage; exit 1;;
+esac

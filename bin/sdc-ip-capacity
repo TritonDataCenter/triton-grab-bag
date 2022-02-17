@@ -1,0 +1,195 @@
+#!/bin/bash
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright 2022 Joyent, Inc.
+
+#
+# Determine how many provisionable IPs remain in the given network.
+#
+# Notes:
+# - TODO: there are networks that given negative "REMAINING" results because:
+#       - reserved IPs in the CIDR range, but outside the provisionable range
+#       - mucked-with provisionable range (netops mentioned this was done
+#         sometimes to force provisioning to a particular IP) such that there
+#         are assigned IPs outside of the provisionable range.
+#   Only right answer here is to do the ip2num calc on all IPs to see if in
+#   the provisionable range. Then we probably would like to see that range
+#   and give numbers on the other parts (outside provisionable range).
+#
+
+# shellcheck disable=SC2154
+if [[ -n "$TRACE" ]]; then
+    export PS4='[\D{%FT%TZ}] ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+    set -o xtrace
+fi
+set -o errexit
+set -o pipefail
+
+
+VERSION=1.0.0
+
+PATH=/usr/bin:/usr/sbin:/smartdc/bin:/opt/smartdc/bin:/opt/local/bin:/opt/local/sbin:/opt/smartdc/agents/bin
+JSON=/opt/smartdc/bin/json
+WRKDIR=/var/tmp/sdc-ip-capacity.d
+
+# This gets used for printf twice.
+TEMPLATE='%-36s  %-9s %-9s %-9s %-8s\n'
+
+#---- internal support functions
+
+function fatal () {
+    echo "$(basename "$0"): fatal error: $*"
+    echo ""
+    usage
+    exit 1
+}
+
+function cleanup () {
+    local status=$?
+    if [[ $status -ne 0 ]]; then
+        echo "error $status (run 'TRACE=1 $0' for more info)"
+    fi
+}
+
+function usage () {
+    echo "Usage:"
+    echo "    sdc-ip-capacity NETWORK|NETWORK-POOL"
+    echo ""
+    echo "Options:"
+    echo "  -h          This help."
+    echo "  -V          Dump this script's version."
+    echo "  -c          Use cached data from APIs if available, for debugging."
+    echo ""
+    echo "Set DEBUG=1 envvar for some debug output, TRACE=1 for xtrace output."
+}
+
+function debug() {
+    [[ -z $DEBUG ]] || echo "$@" >&2
+}
+
+function networkCapacity() {
+    local netUuid="$1"
+
+    if [[ -z "$netUuid" ]]; then
+        fatal "no NETWORK-UUID was given"
+    fi
+
+    local netObj
+    netObj=$(sdc-napi "/networks/$netUuid" -f | json -H)
+    if [[ -z "$netObj" ]]; then
+        fatal "network $netUuid not found"
+    fi
+    debug "Network: $netObj"
+
+    if [[ ! -f $WRKDIR/used-ips.$netUuid ]]; then
+        # Dump all zone IPs for this network, as best we can.
+        debug "Gathering all zone IPs for this network"
+        local limit=1000
+        local offset=0
+        touch "$WRKDIR/used-ips.$netUuid"
+        while true; do
+            page=$(sdc-napi "/networks/$netUuid/ips?limit=$limit&offset=$offset" -f \
+                | $JSON -c '!this.free' -Hao jsony-0 | tee -a "$WRKDIR/used-ips.$netUuid")
+            if [[ "$(echo "$page" | wc -l | awk '{print $1}')" -lt $limit ]]; then
+                break
+            fi
+            offset=$(( offset + limit ))
+        done
+    fi
+
+    local numUsedIps
+    numUsedIps=$(wc -l "$WRKDIR/used-ips.$netUuid" | awk '{print $1}')
+    debug "used IPs: $numUsedIps"
+
+    # XXX local usage
+    provStartIp=$(echo "$netObj" | $JSON provision_start_ip)
+    provEndIp=$(echo "$netObj" | $JSON provision_end_ip)
+    napiZone=$(vmadm lookup -1 alias=napi0)
+    provStartNum=$(/zones/"${napiZone}"/root/opt/smartdc/napi/node/bin/node /zones/"${napiZone}"/root/opt/smartdc/napi/bin/ip2num "$provStartIp")
+    provEndNum=$(/zones/"${napiZone}"/root/opt/smartdc/napi/node/bin/node /zones/"${napiZone}"/root/opt/smartdc/napi/bin/ip2num "$provEndIp")
+    # +1 because the range is inclusive.
+    numIps=$(( provEndNum - provStartNum + 1 ))
+
+    remainingIps=$(( numIps - numUsedIps ))
+    capacity="$(( numUsedIps * 100 / numIps ))%"
+
+    # shellcheck disable=SC2059
+    printf "$TEMPLATE" "$netUuid" "$numIps" "$remainingIps" "$numUsedIps" "$capacity"
+}
+
+
+#---- mainline
+
+[[ "$(zonename)" == "global" ]] || fatal "This must from from the global zone"
+[[ "$(hostname)" == "headnode" ]] || fatal "This must from from the headnode"
+
+trap 'cleanup' EXIT
+
+# shellcheck disable=SC1091
+source /.dcinfo
+
+use_cache=
+while getopts "hVc" opt
+do
+    case "$opt" in
+        h)
+            usage
+            exit 0
+            ;;
+        V)
+            echo "$0 $VERSION"
+            exit 0
+            ;;
+        c)
+            use_cache=1
+            ;;
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+uuid=$1
+if [[ -z "$uuid" ]]; then
+    fatal "no NETWORK-UUID was given"
+fi
+
+if [[ -z "$use_cache" ]]; then
+    rm -rf $WRKDIR
+fi
+mkdir -p $WRKDIR
+
+
+# Is this a net pool or network?
+set +o errexit
+netPoolObj=$(sdc-napi "/network_pools/$uuid" -f 2>/dev/null)
+isNetPoolRv="$?"
+set -o errexit
+
+
+#netObj=$(sdc-napi /networks/$netUuid -f | json -H)
+#if [[ -z "$netObj" ]]; then
+#    fatal "network $netUuid not found"
+#fi
+
+
+    # shellcheck disable=SC2059
+printf "$TEMPLATE" "NETWORK" "IPS" "REMAINING" "ASSIGNED" "CAPACITY"
+
+if [[ "$isNetPoolRv" == "0" ]]; then
+    netPoolObj=$(echo "$netPoolObj" | $JSON -H)
+    debug "Network pool: $netPoolObj"
+    echo "$netPoolObj" | $JSON networks | $JSON -a | while read -r netUuid; do
+        networkCapacity "$netUuid"
+    done
+else
+    networkCapacity "$uuid"
+fi
+
+
+

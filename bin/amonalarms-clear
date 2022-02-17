@@ -1,0 +1,140 @@
+#!/bin/bash
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright 2022 Joyent, Inc.
+#
+# Clear out alarm data for a given user UUID in amonredis.
+#
+# This tools exists because amon-master's usage of redis falls over when there
+# are a lot of current alarms. Sometimes the only recovery (until amon-master
+# is improved here) is to flush out current alarm data and restart amon-master.
+#
+# This presumes it is running from the GZ.
+#
+
+# shellcheck disable=SC2154
+if [[ -n "$TRACE" ]]; then
+    export PS4='[\D{%FT%TZ}] ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+    set -o xtrace
+fi
+set -o errexit
+set -o pipefail
+
+VERSION=1.1.0
+
+
+#---- internal support functions
+
+function fatal () {
+    echo "$(basename "$0"): fatal error: $*"
+    echo ""
+    usage
+    exit 1
+}
+
+function cleanup () {
+    local status=$?
+    if [[ $status -ne 0 ]]; then
+        echo "error $status (run 'TRACE=1 $0' for more info)"
+    fi
+}
+
+
+function usage () {
+    echo "Usage:"
+    echo "  amonalarms-clear                  # list users with alarm data"
+    echo "  amonalarms-clear [-n] <user-uuid> # flush alarm data for this user"
+    echo ""
+    echo "Options:"
+    echo "  -h          This help."
+    echo "  -V          Dump this script's version."
+    echo "  -n          Do a dry-run (showing keys that would be removed "
+    echo "              from Amon's Redis."
+}
+
+
+#---- mainline
+
+[[ "$(zonename)" == "global" ]] || fatal "This must from from the global zone"
+[[ "$(hostname)" == "headnode" ]] || fatal "This must from from the headnode"
+
+trap 'cleanup' EXIT
+
+dry_run=false
+while getopts "hVn" opt
+do
+    case "$opt" in
+        h)
+            usage
+            exit 0
+            ;;
+        V)
+            echo "$0 $VERSION"
+            exit 0
+            ;;
+        n)
+            dry_run=true
+            shift;
+            ;;
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+userUuid=$1
+
+if [[ -z "$userUuid" ]]; then
+    echo "# The following users have alarm data. Use"
+    echo "#      $0 <user-uuid>"
+    echo "# to clear alarm data for that user."
+    userUuids=$(pfexec sdc-login -l amonredis0 \
+        '/opt/redis/bin/redis-cli --raw -n 1 keys alarms:*' \
+        | cut -d: -f2)
+    for uuid in $userUuids; do
+        data=$(pfexec sdc sdc-useradm get "$uuid" | json -ga uuid login)
+        nalarms=$(pfexec sdc-login -l amonredis0 \
+            "/opt/redis/bin/redis-cli --raw -n 1 scard 'alarms:$uuid'")
+        echo "$data $nalarms"
+    done
+        #| xargs -n1 pfexec sdc sdc-useradm get \
+        #| json -ga uuid login email cn
+else
+    if [[ $(echo "$userUuid" | (grep -E '^[-0-9a-f]+$' || true)) != "$userUuid" ]] ||
+       (( ${#userUuid} != 36)); then
+        echo "error: '$userUuid' doesn't look like a UUID" >&2
+        exit 1
+    fi
+
+    toDel=$(pfexec sdc-login -l amonredis0 \
+        "
+        echo 'alarms:$userUuid'; \
+        /opt/redis/bin/redis-cli --raw -n 1 keys 'alarm:$userUuid:*'; \
+        /opt/redis/bin/redis-cli --raw -n 1 keys 'faults:$userUuid:*';
+        " | sed 's/^/del /')
+    count=$(echo "$toDel" | wc -l | awk '{print $1}')
+    if [[ $count -eq 0 ]]; then
+        echo "# No alarm data for user $userUuid"
+    elif [[ "$dry_run" == "true" ]]; then
+        echo "# (dry-run) Deleting $count alarm data keys for user $userUuid"
+        echo "$toDel"
+        echo ""
+        echo "# (This was a dry-run. No redis keys were deleted.)"
+    else
+        echo "# Deleting $count alarm data keys for user $userUuid"
+        # XXX Not sure about the /dev/null redir. Want to drop the "1"s output
+        #     on the 'del' commands.
+        echo "$toDel" | pfexec sdc-login -l amonredis0 /opt/redis/bin/redis-cli -n 1 >/dev/null
+
+        echo ""
+        echo "# Restarting amon-master service."
+        pfexec sdc-login -l amon0 svcadm restart amon-master
+        echo "# Run the following to tail its log:"
+        # shellcheck disable=SC2016
+        echo '#    pfexec tail -f `svcs -z $(vmadm lookup -1 alias=amon0) -L amon-master` | bunyan'
+    fi
+fi

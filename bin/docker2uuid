@@ -1,0 +1,39 @@
+#!/bin/bash
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright 2022 Joyent, Inc.
+
+set -o errexit
+set -o pipefail
+
+# shellcheck disable=SC2154
+if [[ -n "$TRACE" ]]; then
+    export PS4='[\D{%FT%TZ}] ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+    set -o xtrace
+fi
+
+dockerid=${1//-}
+
+if [[ -z ${dockerid} ]]; then
+    echo "Usage: $0 <dockerid>" >&2
+    exit 2
+fi
+
+uuid=$( (awk '{print substr($0,0,8) "-" substr($0,9,4) "-" substr($0,13,4) "-" substr($0,17,4) "-" substr($0,21,12)}' \
+    | sed -e "s/-*$//") <<< "${dockerid}")
+
+if (( ${#dockerid} > 32 )); then
+    echo "${uuid}"
+    exit 0
+fi
+
+vmobj_uuid=$(pfexec sdc-vmapi "/vms?query=(%26(docker=true)(uuid=${uuid}*))" | json -Ha uuid)
+if [[ -n ${vmobj_uuid} ]]; then
+    echo "${vmobj_uuid}"
+    exit 0
+fi
+echo "Cannot find VM matching ${uuid}*" >&2
+exit 1

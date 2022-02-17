@@ -1,0 +1,80 @@
+#!/bin/bash
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright 2022 Joyent, Inc.
+
+basename="${0##*/}" # Same as $(basename $0)
+
+# shellcheck disable=SC2154
+if [[ -n "$TRACE" ]]; then
+    export PS4='[\D{%FT%TZ}] ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+    set -o xtrace
+fi
+
+usage() {
+    printf 'Usage:\n\t'
+    printf '%s add|remove uuid key [value]\n' "$basename"
+    exit
+}
+
+get_traits() {
+    sdc-cnapi "/servers/$1" | json -H -o json-0 traits
+}
+
+set_traits() {
+    uuid="$1"
+    new_traits="$2"
+    printf 'Old traits:\n%s\n' "$(get_traits "$uuid" | json)"
+    printf 'New traits:\n%s\n' "$(json <<< "$new_traits")"
+    sdc-cnapi "/servers/$uuid" -X POST -d "$new_traits"
+}
+
+add_trait () {
+    uuid="$1"
+    add_trait="$2"
+    value="${3:-true}"
+    current_traits=$(get_traits "$uuid")
+
+    if [[ ${value,,} =~ (true|false) ]]; then
+        new_traits=$(json -e "this.${add_trait}=${value,,}" <<< "$current_traits")
+    else
+        new_traits=$(json -e "this.${add_trait}=\"${value,,}\"" <<< "$current_traits")
+    fi
+    set_traits "$uuid" "$new_traits"
+}
+
+remove_trait () {
+    uuid="$1"
+    remove_trait="$2"
+    current_traits=$(get_traits "$uuid")
+    new_traits=$(json -e "this.${remove_trait}=undefined" <<< "$current_traits")
+    set_traits "$uuid" "$new_traits"
+}
+
+action="$1"
+uuid="$2"
+trait="$3"
+value="$4"
+
+if (( ${#uuid} != 36 )); then
+    printf '%s is not a uuid\n' "$uuid"
+    usage 1
+fi
+
+case "$action" in
+    add)
+        add_trait "$uuid" "$trait" "$value"
+	;;
+    remove)
+        remove_trait "$uuid" "$trait"
+	;;
+    help|-h|--help)
+        usage 0
+	;;
+    *)
+        usage 1
+	;;
+esac

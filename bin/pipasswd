@@ -1,0 +1,93 @@
+#!/bin/bash
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright 2022 Joyent, Inc.
+
+set -o errexit
+set -o pipefail
+
+if [[ -n "$TRACE" ]]; then
+    export PS4='[\D{%FT%TZ}] ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+    set -o xtrace
+fi
+
+# Need node-json to extract the image UUID. Some enterprising reader may
+# want to add jq support. Patches welcome!
+if ! command -V json >/dev/null; then
+    # shellcheck disable=SC2016
+    printf 'json command not found. Maybe `npm install -g json`?\n'
+    exit 1;
+fi
+
+case $HOSTNAME in
+    headnode)
+        cache_dir=/mnt/usbkey/private ;;
+    *)
+        cache_dir=~/.triton/private
+        [[ -d $cache_dir ]] || mkdir -p "$cache_dir"
+        ;;
+esac
+
+platform=$(tr '[:lower:]' '[:upper:]' <<< "$1")
+pw_file="${cache_dir}/root.password.${platform:?}"
+
+# If this is a headnode and the key is not currently mounted, mount it.
+if [[ $HOSTNAME == headnode ]]; then
+    orig_key_status=$(pfexec sdc-usbkey status)
+    [[ $orig_key_status != mounted ]] && pfexec sdc-usbkey mount >/dev/null
+fi
+
+if [[ -f ${pw_file} ]]; then
+    cat "${pw_file}"
+    # If this is a headnode and the key was not originally mounted, unmount it.
+    [[ $HOSTNAME == headnode ]] && [[ $orig_key_status != mounted ]] && pfexec sdc-usbkey unmount
+    exit 0
+fi
+
+case $OSTYPE in
+    solaris*|linux*)
+        tmpdir=$(mktemp -d -p /var/tmp pipasswd.XXXXXX) ;;
+    darwin*)
+        tmpdir=$(mktemp -d -t pipasswd) ;;
+    *)
+        printf "Sorry, I don't know how to use mktemp on %s\n" "$OSTYPE"
+        printf 'Please let us know so we can add it!\n'
+        exit 1
+        ;;
+esac
+
+cd "${tmpdir:?}" || { printf 'Cound not chdir to %s\n' "$tmpdir" ; exit 1 ; }
+
+# Use updates.joyent.com as a fast index.
+image_uuid=$(curl -sS "https://updates.joyent.com/images?name=platform&version=~${platform}&channel=*" | json -Ha uuid)
+image_file="https://updates.joyent.com/images/${image_uuid}/file?channel=*"
+
+curl -# -o platform.tgz "$image_file"
+case $OSTYPE in
+    darwin*)
+        tar -zxf platform.tgz --include '*/root.password' ;;
+    solaris*)
+        gtar -zxf platform.tgz --wildcards '*/root.password' ;;
+    linux*)
+        tar -zxf platform.tgz --wildcards '*/root.password' ;;
+    *)
+        printf "Sorry, I don't know how to find gnu tar on %s\n" "$OSTYPE"
+        printf 'Please let us know so we can add it!\n'
+        exit 1
+        ;;
+esac
+
+if [[ -f platform-${platform}/root.password ]]; then
+    mv "platform-${platform}/root.password" "$pw_file"
+fi
+
+cat "$pw_file"
+
+# Make sure $CWD is not $tmpdir before removing it.
+cd / && rm -rf "${tmpdir:?}"
+
+# If this is a headnode and the key was not originally mounted, unmount it.
+[[ $HOSTNAME == headnode ]] && [[ $orig_key_status != mounted ]] && pfexec sdc-usbkey unmount

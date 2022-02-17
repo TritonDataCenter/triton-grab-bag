@@ -1,0 +1,276 @@
+#!/bin/bash
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright 2022 Joyent, Inc.
+
+#
+# Determine wasted IPs (tied up by failed/destroyed VMs) for the given
+# network. See NAPI-327.
+#
+# Notes:
+# - RFE: Support looking at all networks in a network pool.
+#
+
+# shellcheck disable=SC2154
+if [[ -n "$TRACE" ]]; then
+    export PS4='[\D{%FT%TZ}] ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+    set -o xtrace
+fi
+set -o errexit
+set -o pipefail
+
+
+VERSION=1.2.0
+
+PATH=/usr/bin:/usr/sbin:/smartdc/bin:/opt/smartdc/bin:/opt/local/bin:/opt/local/sbin:/opt/smartdc/agents/bin
+VERBOSE=1     # set empty to not be verbose
+JSON=/opt/smartdc/bin/json
+WRKDIR=/var/tmp/sdc-wasted-ips.d
+
+
+#---- internal support functions
+
+function fatal () {
+    echo "$(basename "$0"): fatal error: $*"
+    echo ""
+    usage
+    exit 1
+}
+
+function cleanup () {
+    local status=$?
+    if [[ $status -ne 0 ]]; then
+        echo "error $status (run 'TRACE=1 $0' for more info)"
+    fi
+}
+
+function usage () {
+    echo "Usage:"
+    echo "    sdc-wasted-ips NETWORK-UUID"
+    echo ""
+    echo "Options:"
+    echo "  -h          This help."
+    echo "  -V          Dump this script's version."
+    echo "  -q          Quiet. Don't output debug messages."
+    echo "  -c          Use cached data from APIs if available, for debugging."
+    echo ""
+    echo "  -f          **Free** these IPs in NAPI, instead of just listing wasted IPs."
+    echo "  -n          Do a dry-run of freeing."
+}
+
+function debug() {
+    [[ -z $VERBOSE ]] || echo "$@" >&2
+}
+
+
+#---- mainline
+
+[[ "$(zonename)" == "global" ]] || fatal "This must from from the global zone"
+[[ "$(hostname)" == "headnode" ]] || fatal "This must from from the headnode"
+
+trap 'cleanup' EXIT
+
+#shellcheck disable=SC1091
+source /.dcinfo
+DC=$SDC_DATACENTER_NAME
+
+use_cache=
+dry_run=
+action=list
+while getopts "hVqcfn" opt
+do
+    case "$opt" in
+        h)
+            usage
+            exit 0
+            ;;
+        V)
+            echo "$0 $VERSION"
+            exit 0
+            ;;
+        q)
+            VERBOSE=
+            ;;
+        c)
+            use_cache=1
+            ;;
+        f)
+            action=free
+            ;;
+        n)
+            dry_run=1
+            ;;
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+netUuid=$1
+if [[ -z "$netUuid" ]]; then
+    fatal "no NETWORK-UUID was given"
+fi
+netObj=$(sdc-napi "/networks/$netUuid" -f | json -H)
+if [[ -z "$netObj" ]]; then
+    fatal "network $netUuid not found"
+fi
+debug "Network: $netObj"
+netFabric=$(echo "$netObj" | json fabric)
+
+if [[ -z "$use_cache" ]]; then
+    rm -rf $WRKDIR
+fi
+mkdir -p $WRKDIR
+
+if [[ ! -f $WRKDIR/ips.$netUuid ]]; then
+    # Dump all zone IPs for this network, as best we can.
+    debug "Gathering all zone IPs for this network"
+    limit=1000
+    offset=0
+    touch "$WRKDIR/ips.$netUuid"
+    while true; do
+        page=$(sdc-napi "/networks/$netUuid/ips?belongs_to_type=zone&limit=$limit&offset=$offset" -f \
+            | $JSON -c '!this.reserved' -Hao jsony-0 | tee -a "$WRKDIR/ips.$netUuid")
+        if [[ "$(echo "$page" | wc -l | awk '{print $1}')" -lt $limit ]]; then
+            break
+        fi
+        offset=$(( offset + limit ))
+    done
+    debug "Zone IPs for network $netUuid: " "$(wc -l "$WRKDIR/ips.$netUuid")"
+fi
+
+if [[ ! -f $WRKDIR/active-vms.uuid ]]; then
+    # Get all active VMs.
+    debug "Gathering all active VMs"
+    limit=1000
+    offset=0
+    touch $WRKDIR/active-vms
+    while true; do
+        page=$(sdc-vmapi "/vms?state=active&limit=$limit&offset=$offset" -f \
+            | $JSON -Hao jsony-0 | tee -a $WRKDIR/active-vms)
+        if [[ "$(echo "$page" | wc -l | awk '{print $1}')" -lt $limit ]]; then
+            break
+        fi
+        offset=$(( offset + limit ))
+    done
+    $JSON -f $WRKDIR/active-vms -ga uuid > $WRKDIR/active-vms.uuid
+    debug "Active VMs: " "$(wc -l $WRKDIR/active-vms)"
+fi
+
+if [[ ! -f $WRKDIR/active-vmadm-vm-ips2 ]]; then
+    # Get all actual in-use IPs (vmadm on the CNs is the authority of truth).
+    debug "Gathering IPs from vmadm lookup on all CNs:"
+    sdc-oneachnode -Ja "vmadm lookup -j | json -c 'this.state !== \"failed\"' -e 'vm=this; this._ = this.nics.map(function (nic) { return [vm.uuid, vm.state, nic.ip, nic.network_uuid || \"no-network-uuid\"].join(\" \"); }).join(\"\n\")' -a _" \
+        | $JSON -ga result.stdout > $WRKDIR/active-vmadm-vm-ips2
+    wc -l $WRKDIR/active-vmadm-vm-ips2 >&2
+fi
+
+# For each IP, see if it belongs to an active VM.
+rm -f "$WRKDIR/wasted-ips.$netUuid"
+touch "$WRKDIR/wasted-ips.$netUuid"
+rm -f "$WRKDIR/warnings.$netUuid"
+touch "$WRKDIR/warnings.$netUuid"
+$JSON -f "$WRKDIR/ips.$netUuid" -ga owner_uuid belongs_to_uuid ip \
+    | while read -r owner vm ip; do
+        : shellcheck "$owner" is unused
+        hitActiveVm=$(grep "$vm" $WRKDIR/active-vms.uuid || true)
+        if [[ -n "$hitActiveVm" ]]; then
+            continue
+        fi
+        if [[ "$netFabric" == "true" ]]; then
+            # If we are checking a fabric network, then only check for active
+            # VM hits against nics on the same fabric network (because fabric
+            # network IP ranges can overlap). We include hits for
+            # 'no-network-uuid' to be conservative and catch NIC objects that
+            # pre-date the addition of "network_uuid".
+            hitActiveVmadmVm=$(grep -E " $ip (no-network-uuid|$netUuid)" $WRKDIR/active-vmadm-vm-ips2 || true)
+        else
+            hitActiveVmadmVm=$(grep -E " $ip " $WRKDIR/active-vmadm-vm-ips2 || true)
+        fi
+        if [[ -n "$hitActiveVmadmVm" ]]; then
+            echo "WARNING: $DC network $netUuid IP $ip belongs to inactive VM $vm (according to VMAPI), *BUT* vmadm tells us that there is an *active* VM with that IP: $hitActiveVmadmVm" | tee -a "$WRKDIR/warnings.$netUuid"
+            continue
+        fi
+        cat <<EOM >>"$WRKDIR/wasted-ips.$netUuid"
+{"network_uuid":"$netUuid", "ip":"$ip", "vm":"$vm"}
+EOM
+    done
+
+
+# Early out if we have no wasted IPs.
+numIps=$(wc -l "$WRKDIR/ips.$netUuid" | awk '{print $1}')
+numWastedIps=$(wc -l "$WRKDIR/wasted-ips.$netUuid" | awk '{print $1}')
+if [[ "$numWastedIps" == "0" ]]; then
+    debug "No wasted IPs (out of $numIps on network $netUuid)"
+    exit 0
+fi
+
+
+# Handle remaining actions.
+if [[ $action == "list" ]]; then
+    $JSON -f "$WRKDIR/wasted-ips.$netUuid" -ga ip vm | while read -r ip vmUuid; do
+        echo "$DC network $netUuid IP $ip belongs to VM $vmUuid which is not active"
+    done
+elif [[ $action == "free" ]]; then
+
+    nwarns=$(wc -l "$WRKDIR/warnings.$netUuid" | awk '{print $1}')
+    if [[ $nwarns -gt 0 ]]; then
+        fatal "Cannot free wasted IPs because there are $nwarns warnings to deal with first."
+    fi
+
+    echo ""
+    echo "* * *"
+    echo "There are $numWastedIps wasted IPs on network $netUuid ($(echo "$netObj" | $JSON name))"
+    echo "Freeing these IPs involves:"
+    echo " - verifying each associated VM is 'failed' or 'destroyed' as we expect,"
+    echo " - if an 'external' nic_tag'd network, verify that we can't ping"
+    echo "   or arp the IP, and"
+    echo " - telling NAPI to release these IPs."
+    echo ""
+    echo "Hit <Enter> to continue freeing these IPs or <Ctrl+C> to abort."
+    read -r
+    echo "* * *"
+
+    netNicTag=$(echo "$netObj" | $JSON nic_tag)
+
+    $JSON -f "$WRKDIR/wasted-ips.$netUuid" -ga ip vm | while read -r ip vmUuid; do
+        vmObj=$(sdc-vmapi "/vms/$vmUuid" | $JSON -H)
+        vmAlias=$(echo "$vmObj" | $JSON alias)
+        vmState=$(echo "$vmObj" | $JSON state)
+        echo ""
+        echo "# Free IP $ip assigned to inactive $DC VM $vmUuid ($vmAlias)"
+        if [[ $vmState != "failed" && $vmState != "destroyed" ]]; then
+            fatal "$DC VM $vmUuid ($vmAlias) with assign IP $ip has state '$vmState': expected 'failed' or 'destroyed'"
+        fi
+        if [[ "$netNicTag" == "external" ]]; then
+            # This is our lame approximation to "is where I'm running (the GZ)
+            # on the same network".
+            set +o errexit
+            echo -n "arp check: "
+            if /usr/sbin/arp "$ip"; then
+                fatal "we were able to arp network $netUuid IP $ip that is meant to be freed"
+            fi
+            echo -n "ping check: "
+            if ping "$ip" 3; then
+                fatal "we were able to ping network $netUuid IP $ip that is meant to be freed"
+            fi
+            set -o errexit
+        fi
+        echo -n "before: "
+        sdc-napi "/networks/$netUuid/ips/$ip" | $JSON -H
+        if [[ -n "$dry_run" ]]; then
+            echo "after: (unchanged, dry-run)"
+        else
+            echo -- "--"
+            echo "after:"
+            sdc-napi "/networks/$netUuid/ips/$ip" -X PUT -d '{"free": true}'
+        fi
+    done
+else
+    fatal "unknown action '$action'"
+fi
