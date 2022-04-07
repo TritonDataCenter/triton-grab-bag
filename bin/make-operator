@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright 2022 Joyent, Inc.
+
+input="$1"
+
+# This will make sure that the input, whether login or uuid, actually exists
+# in UFDS and we don't just blindly add garbage to the operator group.
+uuid=$(pfexec sdc-useradm get "$input" | json uuid)
+
+if (( ${#uuid} == 36 )); then
+    sdc-ufds modify --type add --attribute uniquemember \
+        --value "uuid=${uuid}, ou=users, o=smartdc" \
+        'cn=operators, ou=groups, o=smartdc'
+else
+    printf "Can't find %s in UFDS\n" "$input"
+fi

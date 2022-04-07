@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright 2022 Joyent, Inc.
+
+key="${1:?}"
+
+mapfile -t users_with_key < <(
+    pfexec sdc-ufds search "(&(objectclass=sdckey)(fingerprint=${key}))" | \
+        json -gaH dn | awk -F, '{print $2}'
+)
+for uuid in "${users_with_key[@]}"; do
+    pfexec sdc-ufds search $uuid | json -Ha uuid login email approved_for_provisioning memberof.0
+done
