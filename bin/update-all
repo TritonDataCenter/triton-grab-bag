@@ -1,0 +1,53 @@
+#!/bin/bash
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright 2022 MNX Cloud, Inc.
+
+# This is a very blunt script that will update all components of Triton.
+# There is no error handling, but if an error occurs, it will abort the rest
+# of the script. Some of these things may not be appropriate to run in your
+# DC every time.
+
+# It's best to just copy/paste these commands one at a time so that you can
+# be fully intentional about each command you are running.
+
+# This script cannot "pick up where it left off". It is not idempotent. If an
+# error occurs, you dear reader, must intervene to correct the situation.
+# Running this script multiple times in an attempt to remedy a broken Triton
+# will almost certainly make things worse.
+#
+# If you ignored the advice above to copy/paste each line individually and this
+# script exited with an error, I urge you again to run only necessary commands
+# manually, line by line.
+
+set -o errexit
+set -o xtrace
+
+imgadm vacuum -f
+
+sdcadm update --all --just-images -y
+sdcadm self-update --allow-major-update --latest
+sdcadm dc-maint start && printf "DC maintenance has started at %s\n" "$(date)"
+sdcadm update --all -y
+sdcadm experimental update-agents --latest --all -y
+# Update any additional services that are not already up to date, if installed
+# (i.e., dockerlogger, firewall-logger-agent)
+sdcadm experimental update --all -y
+sdcadm experimental update-other
+sdcadm experimental update-gz-tools --latest
+sdcadm dc-maint stop && printf "DC maintenance has ended at %s\n" "$(date)"
+sdcadm platform remove -a --cleanup-cache -y || true # There might not be any unused platforms
+sdcadm platform install --latest
+sdcadm platform assign --latest --all
+sdcadm platform set-default --latest
+
+printf 'Update of all components complete\n'
+printf 'Compute nodes will be on the latest PI on their next boot.\n'
+
+now=$(date +%Y%m%dT%H%M%SZ)
+
+[[ -d /opt/custom/history ]] || mkdir -p /opt/custom/history
+sdc-vmapi /vms?state=active\&tag.smartdc_type=core | json -Ha > "/opt/custom/history/core_instances_${now}.json"

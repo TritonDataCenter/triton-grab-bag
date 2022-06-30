@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright 2022 MNX Cloud, Inc.
+
+# This script will install the latest platform. It will pass args to sdcadm
+# for the install step so you can specify a different channel. See sdcadm(1).
+
+set -o errexit
+set -o xtrace
+
+sdcadm platform install --latest "$@"
+sdcadm platform assign --latest --all
+sdcadm platform set-default --latest
+
+printf 'The latest platform has been staged to all CNs.\n\n'
+
+sdcadm platform list
