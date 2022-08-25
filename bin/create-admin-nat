@@ -1,0 +1,100 @@
+#!/bin/bash
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright 2022 MNX Cloud, Inc.
+#
+
+# By default, compute nodes do not have access to the Internet. In general
+# they don't need it, and are intended to work fine without it. In some
+# environments, having external NAT is desirable. It allows things like
+# setting up pkgsrc and uploading to Manta. Normally network operators will
+# configure NAT on the network hardware. In cases where that is not feasible,
+# we can take matters into our own hands.
+#
+# This script will:
+#
+# * Create a new nat zone on the headnode that will NAT out for the admin
+#   network
+# * Update the admin network to include resolvers from the external network
+#   (so that CNs will get usable external resolvers)
+# * Configure the dhcp service to set the new nat zone's admin IP ad the
+#   default gateway
+#
+# After it is complete, each compute node needs to be rebooted to receive the
+# new configuration. After reboot, compute nodes should be able to reach the
+# Internet.
+
+# shellcheck disable=SC2154
+if [[ -n "$TRACE" ]]; then
+    export PS4='[\D{%FT%TZ}] ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+    set -o xtrace
+fi
+set -o errexit
+set -o pipefail
+
+nat_template='{
+  "service_uuid": "%s",
+  "params": {
+    "alias": "cnnat0",
+    "server_uuid": "%s",
+    "internal_metadata": {
+      "com.joyent:ipnat_owner": "%s"
+    },
+    "networks": [
+      {
+        "uuid": "%s",
+        "primary": true,
+        "allow_ip_spoofing": true
+      },
+      {
+        "uuid": "%s",
+        "allow_ip_spoofing": true
+      }
+    ]
+  },
+  "metadata": {
+    "sapi-url": "http://%s",
+    "com.joyent:ipnat_subnet": "%s"
+  },
+  "type": "vm"
+}'
+
+nat_service_uuid=$(sdc-sapi /services?name=nat | json -H 0.uuid)
+headnode_uuid=$(sdc-cnapi /servers?hostname=headnode | json -H 0.uuid)
+admin_account_uuid=$(sdc-useradm get admin | json uuid)
+external_network_uuid=$(sdc-napi /networks?name=external | json -H 0.uuid)
+admin_network_uuid=$(sdc-napi /networks?name=admin | json -H 0.uuid)
+admin_network_subnet=$(sdc-napi "/networks/${admin_network_uuid}" | json -H subnet)
+sapi_ip=$(sdcadm insts -j sapi | json 0.ip)
+
+admin_resolvers=$(sdc-napi /networks?name=admin | json -Ha -o jsony-0 resolvers)
+external_resolvers=$(sdc-napi /networks?name=external | json -Ha -o jsony-0 resolvers)
+combined_resolvers=$(printf '%s\n%s' "$admin_resolvers" "$external_resolvers" | json -g -o jsony-0)
+
+# shellcheck disable=SC2059
+payload=$(printf "$nat_template" \
+        "$nat_service_uuid" \
+        "$headnode_uuid" \
+        "$admin_account_uuid" \
+        "$external_network_uuid" \
+        "$admin_network_uuid" \
+        "$sapi_ip" \
+        "$admin_network_subnet"
+)
+
+sapiadm provision <<< "$payload"
+
+nat_ip=$(sdcadm insts nat -j | json -ac 'this.alias=="cnnat0"' ip)
+admin_net_update=$(printf '{"gateway":"%s","resolvers":%s}' "$nat_ip" "$combined_resolvers")
+
+sdc-napi "/networks/${admin_network_uuid}" -X PUT -d "$admin_net_update"
+dhcpd_svc=$(sdc-sapi /services?name=dhcpd | json -Ha uuid)
+sapiadm update "$dhcpd_svc" metadata.compute_node_default_gateway="$nat_ip"
+
+cat << EOF
+NAT set up complete. You must reboot each compute node for it to receive the
+new settings.
+EOF

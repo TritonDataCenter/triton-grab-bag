@@ -15,6 +15,25 @@ This directory contains miscellaneous tools that are not shipped with Triton,
 but users may find useful in some circumstances. Some of these tools may be
 included as part of Triton in the future.
 
+## Installing
+
+Each tool is independent, so you can download individual tools or all of them.
+To install, you can:
+
+* use `curl` to fetch individual files
+* use `curl` to fetch the branch head. Click the green "Code" button at the top
+  of this page in github.
+* clone this repo using `git`. You can first set up pkgsrc with
+  the `/smartdc/bin/pkgsrc-setup` script, or follow the pkgsrc-tools
+  instructions on [https://pkgsrc.smartos.org][1].
+* use the bash installer script:
+
+        curl https://raw.githubusercontent.com/TritonDataCenter/triton-grab-bag/master/install.sh | bash
+
+Usually these are installed to `/opt/gb/bin`, but can be relocated anywhere.
+
+[1]: https://pkgsrc.smartos.org/install-on-illumos/
+
 ## Some things to know
 
 Generally these would be copied to `/opt/custom/bin`. Most (but not all) will
@@ -41,6 +60,7 @@ of each for additional info.
 | cn-comments            | Edit comments field in cnapi                        |
 | cn-hostname            | Change the hostname of a CN                         |
 | cn-trait               | Edit CN traits                                      |
+| create-admin-nat       | Create a NAT zone for the Triton admin network      |
 | docker2uuid            | Look up UUID of a zone based on the short Docker ID |
 | fp-search              | Search UFDS for accounts that have key fingerprint  |
 | get_link_lldp.sh       | Report LLDP links                                   |
