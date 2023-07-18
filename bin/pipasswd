@@ -5,6 +5,7 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
 # Copyright 2022 Joyent, Inc.
+# Copyright 2023 MNX Cloud, Inc.
 
 set -o errexit
 set -o pipefail
@@ -64,6 +65,16 @@ cd "${tmpdir:?}" || { printf 'Cound not chdir to %s\n' "$tmpdir" ; exit 1 ; }
 # Use updates.joyent.com as a fast index.
 image_uuid=$(curl -sS "https://updates.joyent.com/images?name=platform&version=~${platform}&channel=*" | json -Ha uuid)
 image_file="https://updates.joyent.com/images/${image_uuid}/file?channel=*"
+
+if [[ -z "$image_uuid" ]]; then
+    printf 'Cannot find platform %s.\n' "$platform" >&2
+    printf 'This is most likely because it was a test image ' >&2
+    printf 'provided by a developer, not\nas a result of a commit to a ' >&2
+    printf 'repo. It is highly recommended that you switch\nto a platform ' >&2
+    printf 'available via either piadm or sdcadm to ensure that all ' >&2
+    printf 'commits\nare properly attributable.\n' &>&2
+    exit 1
+fi
 
 curl -# -o platform.tgz "$image_file"
 case $OSTYPE in
