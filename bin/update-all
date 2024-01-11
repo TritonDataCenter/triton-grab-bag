@@ -38,6 +38,9 @@ sdcadm experimental update-agents --latest --all -y
 sdcadm experimental update --all -y
 sdcadm experimental update-other
 sdcadm experimental update-gz-tools --latest
+# If you want to update portolan (which potentially disrupts fabric networks)
+# Uncomment the next line:
+# sdcadm update --force-data-path portolan
 sdcadm dc-maint stop && printf "DC maintenance has ended at %s\n" "$(date)"
 sdcadm platform remove -a --cleanup-cache -y || true # There might not be any unused platforms
 sdcadm platform install --latest
